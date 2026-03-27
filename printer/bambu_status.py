@@ -109,6 +109,17 @@ class BambuStatus:
             except Exception:
                 pass
 
+    def publish_command(self, payload: dict) -> bool:
+        """Publish a command to device/{serial}/request over the live MQTT connection.
+
+        Returns True on success, False if not connected.
+        """
+        if not self._client or not self._connected:
+            return False
+        topic = f"device/{self.serial}/request"
+        result = self._client.publish(topic, json.dumps(payload), qos=1)
+        return result.rc == 0   # 0 == MQTT_ERR_SUCCESS
+
     def snapshot(self) -> PrinterSnapshot:
         """Return a copy of the latest printer state."""
         with self._lock:

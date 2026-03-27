@@ -23,19 +23,31 @@ PRINT_TOPIC_TMPL = "device/{serial}/request"
 REPORT_TOPIC_TMPL = "device/{serial}/report"
 
 
-def send_print_job(remote_filename: str) -> None:
+def send_print_job(remote_filename: str, bambu_status=None) -> None:
     """
     Dispatch a print job to the Bambu printer via MQTT.
 
     Args:
         remote_filename: filename (without path) already uploaded via FTPS.
+        bambu_status:    optional BambuStatus instance with a live MQTT
+                         connection.  If provided (and connected), the
+                         existing connection is reused instead of opening
+                         a new one (the printer only accepts one MQTT client).
 
     Raises:
         RuntimeError on failure.
     """
-    topic = PRINT_TOPIC_TMPL.format(serial=config.BAMBU_SERIAL)
     payload = _build_payload(remote_filename)
 
+    # Prefer the already-connected status client to avoid second-connection rejection
+    if bambu_status is not None:
+        ok = bambu_status.publish_command(payload)
+        if ok:
+            log.info("MQTT print job sent via status connection: %s", remote_filename)
+            return
+        log.warning("Status client not connected — falling back to new connection")
+
+    topic = PRINT_TOPIC_TMPL.format(serial=config.BAMBU_SERIAL)
     for attempt in range(1, config.MAX_MQTT_RETRIES + 1):
         try:
             _publish_once(topic, payload)
@@ -96,7 +108,7 @@ def _build_payload(remote_filename: str) -> dict:
             "command": "project_file",
             "param": f"Metadata/plate_1.gcode",
             "subtask_name": remote_filename,
-            "url": f"ftp://bblp:{config.BAMBU_ACCESS_CODE}@{config.BAMBU_IP}/upload/{remote_filename}",
+            "url": f"ftp://bblp:{config.BAMBU_ACCESS_CODE}@{config.BAMBU_IP}/cache/{remote_filename}",
             "bed_type": "auto",
             "timelapse": False,
             "bed_leveling": True,

@@ -926,13 +926,24 @@ def main():
                 from printer.ftps_transfer import upload_stl
                 from printer.mqtt_client import send_print_job
 
-                cfg_status     = "Uploading to printer..."
+                cfg_status     = "Slicing model..."
                 cfg_status_col = YELLOW
-                remote_name = upload_stl(stl_path)
 
+                # Extract print settings from UI selection
+                _fields = get_cfg_fields()
+                _summary = {name: opts[cfg_values.get(name, idx)]
+                            for name, opts, idx in _fields}
+                _printer_model = _summary.get("Printer", "Bambu A1").split("  ")[0]
+                _layer_h       = _summary.get("Layer Height", "0.20mm")
+                _filament      = _summary.get("Filament", "PLA")
+
+                remote_name = upload_stl(stl_path,
+                                         printer_model=_printer_model,
+                                         layer_height=_layer_h,
+                                         filament=_filament)
                 cfg_status     = "Sending print command..."
                 cfg_status_col = YELLOW
-                send_print_job(remote_name)
+                send_print_job(remote_name, bambu_status=_bambu)
 
                 cfg_status     = f"Printing: {cfg_result.name[:40]}"
                 cfg_status_col = GREEN
