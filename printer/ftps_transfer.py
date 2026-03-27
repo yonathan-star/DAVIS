@@ -33,7 +33,8 @@ _PROCESS_PROFILES = {
     "0.16mm": f"{_PROFILES_DIR}/process/0.16mm Optimal @BBL A1.json",
     "0.20mm": f"{_PROFILES_DIR}/process/0.20mm Standard @BBL A1.json",
     "0.24mm": f"{_PROFILES_DIR}/process/0.24mm Draft @BBL A1.json",
-    "0.28mm": f"{_PROFILES_DIR}/process/0.28mm Draft @BBL A1.json",
+    "0.28mm": f"{_PROFILES_DIR}/process/0.28mm Extra Draft @BBL A1.json",
+    "0.32mm": f"{_PROFILES_DIR}/process/0.20mm Standard @BBL A1.json",  # fallback
 }
 _FILAMENT_PROFILES = {
     "PLA":      f"{_PROFILES_DIR}/filament/Generic PLA @BBL A1.json",

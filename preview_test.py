@@ -893,17 +893,24 @@ def main():
         def _dispatch():
             nonlocal cfg_status, cfg_status_col, return_to_gallery_at
 
+            # Wait for STL download (up to 30s)
             t0 = time.time()
             while cfg_result.stl_downloading and time.time() - t0 < 30:
                 time.sleep(0.3)
 
             if cfg_result.stl_error:
-                cfg_status     = f"STL download failed: {cfg_result.stl_error[:50]}"
+                cfg_status     = f"Download failed: {cfg_result.stl_error[:55]}"
                 cfg_status_col = RED
-                return_to_gallery_at = time.time() + 3.0
+                return_to_gallery_at = time.time() + 6.0
                 return
 
             stl_path = cfg_result.stl_path
+            if not stl_path:
+                cfg_status     = "No STL file — download may have timed out"
+                cfg_status_col = RED
+                return_to_gallery_at = time.time() + 6.0
+                return
+
             print(f"  STL: {stl_path}")
 
             try:
@@ -917,9 +924,9 @@ def main():
                 has_printer = False
 
             if not has_printer:
-                cfg_status     = "Saved locally -- configure printer to dispatch"
+                cfg_status     = "No printer configured"
                 cfg_status_col = YELLOW
-                return_to_gallery_at = time.time() + 3.0
+                return_to_gallery_at = time.time() + 5.0
                 return
 
             try:
@@ -933,27 +940,47 @@ def main():
                 _fields = get_cfg_fields()
                 _summary = {name: opts[cfg_values.get(name, idx)]
                             for name, opts, idx in _fields}
-                _printer_model = _summary.get("Printer", "Bambu A1").split("  ")[0]
+                _printer_model = _summary.get("Printer", "Bambu A1").split("  ")[0].strip()
                 _layer_h       = _summary.get("Layer Height", "0.20mm")
-                _filament      = _summary.get("Filament", "PLA")
+                # Filament dropdown may be "AMS 1-A  PLA  Bambu" — extract material (2nd part)
+                _fil_raw  = _summary.get("Filament", "PLA")
+                _fil_parts = [p.strip() for p in _fil_raw.split("  ") if p.strip()]
+                _filament = _fil_parts[1] if len(_fil_parts) >= 2 else _fil_parts[0] if _fil_parts else "PLA"
 
                 remote_name = upload_stl(stl_path,
                                          printer_model=_printer_model,
                                          layer_height=_layer_h,
                                          filament=_filament)
+
+                # BambuStudio may have briefly taken the MQTT slot — wait for reconnect
+                if _bambu is not None and not _bambu.is_online():
+                    cfg_status     = "Waiting for printer..."
+                    cfg_status_col = YELLOW
+                    deadline = time.time() + 15
+                    while not _bambu.is_online() and time.time() < deadline:
+                        time.sleep(0.3)
+
                 cfg_status     = "Sending print command..."
                 cfg_status_col = YELLOW
                 send_print_job(remote_name, bambu_status=_bambu)
 
-                cfg_status     = f"Printing: {cfg_result.name[:40]}"
+                cfg_status     = f"Sent to printer!"
                 cfg_status_col = GREEN
-                print(f"  [OK] Dispatched to printer")
+                print(f"  [OK] Dispatched: {cfg_result.name}")
+                return_to_gallery_at = time.time() + 5.0
+                return
             except Exception as exc:
-                cfg_status     = f"Printer error: {str(exc)[:60]}"
+                err = str(exc)
+                if "MQTT dispatch failed" in err:
+                    err = "Printer not responding (MQTT)"
+                elif "FTPS transfer failed" in err:
+                    err = "File upload failed (FTPS)"
+                elif "BambuStudio not found" in err:
+                    err = "BambuStudio not found — install it to print"
+                cfg_status     = f"Error: {err[:62]}"
                 cfg_status_col = RED
                 print(f"  [ERROR] {exc}")
-
-            return_to_gallery_at = time.time() + 3.0
+                return_to_gallery_at = time.time() + 6.0
 
         threading.Thread(target=_dispatch, daemon=True).start()
 

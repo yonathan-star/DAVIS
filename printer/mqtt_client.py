@@ -116,6 +116,6 @@ def _build_payload(remote_filename: str) -> dict:
             "vibration_cali": True,
             "layer_inspect": False,
             "use_ams": False,
-            "profile_id": config.BAMBU_PROFILE,
+            "profile_id": "",
         }
     }
