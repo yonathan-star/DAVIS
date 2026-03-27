@@ -47,20 +47,31 @@ class ImplicitFTP_TLS(ftplib.FTP_TLS):
         return self.welcome
 
 
+def _stl_to_3mf(stl_path: str) -> str:
+    """Convert STL to 3MF (what Bambu printers accept). Returns path to .3mf file."""
+    import trimesh
+    mesh = trimesh.load(stl_path)
+    out_path = stl_path.replace(".stl", ".3mf")
+    mesh.export(out_path)
+    return out_path
+
+
 def upload_stl(stl_path: str) -> str:
     """
-    Upload stl_path to the Bambu printer via FTPS.
+    Convert STL to 3MF and upload to the Bambu printer via FTPS.
 
     Returns:
-        The remote filename (basename only).
+        The remote filename (basename only, .3mf extension).
 
     Raises:
         RuntimeError on any failure.
     """
-    remote_filename = os.path.basename(stl_path)
-    remote_path = f"/upload/{remote_filename}"
+    # Bambu printers accept 3MF, not raw STL
+    upload_path = _stl_to_3mf(stl_path) if stl_path.endswith(".stl") else stl_path
+    remote_filename = os.path.basename(upload_path)
+    remote_path     = f"/upload/{remote_filename}"
 
-    log.info("FTPS connecting to %s:%d …", config.BAMBU_IP, config.BAMBU_PORT_FTPS)
+    log.info("FTPS connecting to %s:%d", config.BAMBU_IP, config.BAMBU_PORT_FTPS)
 
     for attempt in range(1, config.MAX_FTPS_RETRIES + 1):
         try:
@@ -68,12 +79,13 @@ def upload_stl(stl_path: str) -> str:
             ftp.connect(host=config.BAMBU_IP, port=config.BAMBU_PORT_FTPS, timeout=30)
             ftp.login(user="bblp", passwd=config.BAMBU_ACCESS_CODE)
             ftp.set_pasv(True)
-            ftp.prot_p()   # ensure data channel is also TLS
+            ftp.prot_p()
 
-            file_size = os.path.getsize(stl_path)
-            log.info("Uploading %s (%.1f KB) → %s", remote_filename, file_size / 1024, remote_path)
+            file_size = os.path.getsize(upload_path)
+            log.info("Uploading %s (%.1f KB) -> %s", remote_filename,
+                     file_size / 1024, remote_path)
 
-            with open(stl_path, "rb") as f:
+            with open(upload_path, "rb") as f:
                 ftp.storbinary(f"STOR {remote_path}", f)
 
             ftp.quit()
@@ -81,6 +93,9 @@ def upload_stl(stl_path: str) -> str:
             return remote_filename
 
         except Exception as exc:
-            log.warning("FTPS attempt %d/%d failed: %s", attempt, config.MAX_FTPS_RETRIES, exc)
+            log.warning("FTPS attempt %d/%d failed: %s",
+                        attempt, config.MAX_FTPS_RETRIES, exc)
             if attempt == config.MAX_FTPS_RETRIES:
-                raise RuntimeError(f"FTPS transfer failed after {config.MAX_FTPS_RETRIES} attempts: {exc}") from exc
+                raise RuntimeError(
+                    f"FTPS transfer failed after {config.MAX_FTPS_RETRIES} attempts: {exc}"
+                ) from exc

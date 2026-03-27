@@ -14,6 +14,7 @@ models/
 
 # Local secrets (never commit printer credentials)
 config.local.py
+printer_config.json
 
 # Thingiverse thumbnail/STL cache
 generation/thingiverse_cache/

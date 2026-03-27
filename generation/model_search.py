@@ -196,15 +196,21 @@ def search(query: str, token: str = "", per_page: int = 20) -> list[ThingResult]
     url = f"{API_BASE}/search/{encoded}?type=things&per_page={per_page}&sort=relevant"
     try:
         data  = _get(url, token)
-        items = data.get("hits", data) if isinstance(data, dict) else data
+        items = (data.get("hits") or data.get("items") or data) \
+                if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            raise ValueError(f"Unexpected search response: {list(data.keys())}")
         results = []
         for item in items[:per_page]:
+            creator = item.get("creator", {})
+            creator_name = (creator.get("name") if isinstance(creator, dict)
+                            else str(creator))
             r = ThingResult(
                 thing_id      = item["id"],
                 name          = item.get("name", "Unnamed"),
-                creator       = item.get("creator", {}).get("name", "Unknown"),
+                creator       = creator_name or "Unknown",
                 likes         = item.get("like_count", 0),
-                thumbnail_url = item.get("thumbnail", ""),
+                thumbnail_url = item.get("thumbnail", "") or item.get("preview_image", ""),
                 thing_url     = item.get("public_url", ""),
                 description   = item.get("description", ""),
             )
@@ -215,42 +221,69 @@ def search(query: str, token: str = "", per_page: int = 20) -> list[ThingResult]
         return _mock_results(query, per_page)
 
 
+# In-memory thumbnail cache: thing_id → BGR array (or None if failed)
+_thumb_cache: dict[int, Optional[np.ndarray]] = {}
+_thumb_loading: set[int] = set()
+
+
 def load_thumbnail(result: ThingResult,
                    W: int = 400, H: int = 300) -> Optional[np.ndarray]:
     """
-    Return thumbnail as BGR numpy array (W x H).
-    For mock results returns the pre-generated swatch.
-    For real results downloads and caches the image.
+    Return thumbnail as BGR numpy array (W x H). Never blocks.
+    - Mock results: returns pre-generated swatch immediately.
+    - Real results: returns cached image if ready, else kicks off a background
+      download and returns a colour placeholder until the download finishes.
     """
     # Mock path — thumbnail already attached as attribute
     if hasattr(result, "_mock_thumb"):
         img = result._mock_thumb   # type: ignore[attr-defined]
-        if img.shape[:2] != (H, W):
-            if _CV2:
-                img = cv2.resize(img, (W, H))
+        if img.shape[:2] != (H, W) and _CV2:
+            img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LANCZOS4)
         return img
 
-    if not result.thumbnail_url:
-        return _colour_swatch(result.name, W, H)
+    # Already downloaded and in memory
+    if result.thing_id in _thumb_cache:
+        img = _thumb_cache[result.thing_id]
+        if img is None:
+            return _colour_swatch(result.name, W, H)
+        if img.shape[:2] != (H, W) and _CV2:
+            img = cv2.resize(img, (W, H), interpolation=cv2.INTER_LANCZOS4)
+        return img
 
-    # Check disk cache
-    cache_name = f"thumb_{result.thing_id}.jpg"
-    cache_path = os.path.join(CACHE_DIR, cache_name)
+    # Kick off background download if not already running
+    if result.thing_id not in _thumb_loading:
+        _thumb_loading.add(result.thing_id)
+        threading.Thread(target=_download_thumb_worker,
+                         args=(result,), daemon=True).start()
 
-    if not os.path.exists(cache_path):
-        try:
+    # Return placeholder while loading
+    return _colour_swatch(result.name, W, H)
+
+
+def _download_thumb_worker(result: ThingResult):
+    try:
+        if not result.thumbnail_url:
+            _thumb_cache[result.thing_id] = None
+            return
+
+        cache_name = f"thumb_{result.thing_id}.jpg"
+        cache_path = os.path.join(CACHE_DIR, cache_name)
+
+        if not os.path.exists(cache_path):
             _ensure_cache()
             _download_file(result.thumbnail_url, cache_path)
-        except Exception as exc:
-            print(f"[model_search] thumbnail download failed: {exc}")
-            return _colour_swatch(result.name, W, H)
 
-    result.thumbnail_path = cache_path
-    if _CV2:
-        img = cv2.imread(cache_path)
-        if img is not None:
-            return cv2.resize(img, (W, H))
-    return _colour_swatch(result.name, W, H)
+        result.thumbnail_path = cache_path
+        if _CV2:
+            img = cv2.imread(cache_path)
+            _thumb_cache[result.thing_id] = img
+        else:
+            _thumb_cache[result.thing_id] = None
+    except Exception as exc:
+        print(f"[model_search] thumbnail download failed: {exc}")
+        _thumb_cache[result.thing_id] = None
+    finally:
+        _thumb_loading.discard(result.thing_id)
 
 
 def _colour_swatch(name: str, W: int, H: int) -> np.ndarray:
@@ -289,12 +322,35 @@ def _download_stl_worker(result: ThingResult, token: str):
         # Get file list
         files_url = f"{API_BASE}/things/{result.thing_id}/files"
         files = _get(files_url, token)
-        stl_files = [f for f in files if f.get("name", "").lower().endswith(".stl")]
-        if not stl_files:
-            raise RuntimeError("No STL files found for this thing")
+        if not isinstance(files, list):
+            raise RuntimeError(f"Unexpected files response type: {type(files)}")
 
-        stl_url = stl_files[0]["public_url"]
-        _download_file(stl_url, cache_path, token)
+        # Prefer STL, fall back to OBJ (trimesh can convert)
+        stl_files = [f for f in files if f.get("name", "").lower().endswith(".stl")]
+        obj_files = [f for f in files if f.get("name", "").lower().endswith(".obj")]
+
+        if stl_files:
+            dl_file = stl_files[0]
+            is_obj  = False
+        elif obj_files:
+            dl_file = obj_files[0]
+            is_obj  = True
+        else:
+            exts = list({f.get("name","").rsplit(".",1)[-1] for f in files})
+            raise RuntimeError(f"No printable files found (available: {exts})")
+
+        # Use download_url (API endpoint) not public_url (HTML page)
+        dl_url = dl_file.get("download_url") or dl_file["public_url"]
+
+        if is_obj:
+            obj_path = cache_path.replace(".stl", ".obj")
+            _download_file(dl_url, obj_path, token)
+            # Convert OBJ → STL via trimesh
+            import trimesh
+            mesh = trimesh.load(obj_path, force="mesh")
+            mesh.export(cache_path)
+        else:
+            _download_file(dl_url, cache_path, token)
         result.stl_path = cache_path
     except Exception as exc:
         result.stl_error = str(exc)

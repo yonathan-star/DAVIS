@@ -52,7 +52,7 @@ BAMBU_PROFILE     = "0.20mm Standard @BBL"
 
 # ─── Thingiverse ─────────────────────────────────────────────────────────────
 
-THINGIVERSE_TOKEN = ""   # Bearer token from https://www.thingiverse.com/apps/create
+THINGIVERSE_TOKEN = "20ab95081189b4f0d69771ba3bbfacca"   # Bearer token from https://www.thingiverse.com/apps/create
                           # Leave blank to use mock/offline results in gallery mode
 
 # ─── Tuning ───────────────────────────────────────────────────────────────────

@@ -41,12 +41,42 @@ Controls (Print config):
 """
 
 import argparse
+import glob
 import math
 import os
 import sys
 import threading
 import time
 from enum import Enum, auto
+
+
+# --- Auto-reload -----------------------------------------------------------
+
+def _start_autoreload():
+    """Watch .py files and execv-restart the process when any change."""
+    root = os.path.dirname(os.path.abspath(__file__))
+
+    def _mtimes():
+        return {f: os.path.getmtime(f)
+                for f in glob.glob(os.path.join(root, "**", "*.py"), recursive=True)}
+
+    baseline = _mtimes()
+
+    def _watch():
+        while True:
+            time.sleep(1)
+            current = _mtimes()
+            for f, mt in current.items():
+                if baseline.get(f) != mt:
+                    print(f"\n[reload] {os.path.relpath(f, root)} changed -- restarting...\n")
+                    time.sleep(0.3)
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+if "--no-reload" not in sys.argv:
+    _start_autoreload()
 
 import cv2
 import numpy as np
@@ -57,6 +87,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from generation.model_gen import parse_description, generate as gen_shape, ModelIntent
 from generation.model_search import search as tv_search, load_thumbnail, start_stl_download, ThingResult
 from stl import mesh as stl_mesh
+from printer.discovery import load_saved, save_config, apply_to_config, start_discovery
 
 try:
     import config
@@ -64,26 +95,40 @@ try:
 except Exception:
     _TOKEN = ""
 
+# -- Printer bootstrap: saved config -> live config module ------------------
+_printer_cfg = load_saved()   # {"ip","serial","access_code","model"} or None
+if _printer_cfg:
+    apply_to_config(_printer_cfg)
 
-# ─── Args ─────────────────────────────────────────────────────────────────────
+from printer.bambu_status import get_status as get_bambu_status
+_bambu = get_bambu_status()   # None if printer not configured
+
+# -- Multi-printer discovery list -------------------------------------------
+_discovered_printers = []
+
+
+# --- Args ------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--width",      type=int, default=1280)
     p.add_argument("--height",     type=int, default=720)
     p.add_argument("--fullscreen", action="store_true")
+    p.add_argument("--no-reload",  action="store_true",
+                   help="Disable auto-reload watcher")
     return p.parse_args()
 
 
-# ─── App modes ────────────────────────────────────────────────────────────────
+# --- App modes -------------------------------------------------------------
 
 class AppMode(Enum):
     GENERATE  = auto()
     GALLERY   = auto()
     PRINT_CFG = auto()
+    SETUP     = auto()    # access-code entry after auto-discovery
 
 
-# ─── Gallery intent detection ─────────────────────────────────────────────────
+# --- Gallery intent detection ----------------------------------------------
 
 _GALLERY_TRIGGERS = [
     "show me", "showcase", "find a", "find me", "search for",
@@ -105,12 +150,9 @@ def is_gallery_intent(text):
     return None
 
 
-# ─── Print config fields ──────────────────────────────────────────────────────
+# --- Print config fields ---------------------------------------------------
 
-CFG_FIELDS = [
-    ("Printer",      ["Bambu A1", "Bambu P1S", "Bambu X1C", "Bambu A1 Mini",
-                      "Prusa MK4", "Ender 3 V3"], 0),
-    ("Filament",     ["PLA", "PETG", "ABS", "TPU", "ASA", "PLA+", "SILK PLA"], 0),
+_CFG_STATIC = [
     ("Layer Height", ["0.08mm", "0.12mm", "0.16mm", "0.20mm",
                       "0.24mm", "0.28mm", "0.32mm"], 3),
     ("Infill",       ["5%", "10%", "15%", "20%", "30%",
@@ -121,12 +163,49 @@ CFG_FIELDS = [
     ("Copies",       [str(i) for i in range(1, 11)], 0),
 ]
 
+_CFG_PRINTER_FALLBACK = ["Bambu A1", "Bambu P1S", "Bambu X1C",
+                          "Bambu A1 Mini", "Prusa MK4", "Ender 3 V3"]
+_CFG_FILAMENT_FALLBACK = ["PLA", "PETG", "ABS", "TPU", "ASA", "PLA+", "SILK PLA"]
+
+
+def get_cfg_fields():
+    """Build CFG_FIELDS dynamically -- uses live printer data if available."""
+    if _discovered_printers:
+        printer_opts = [d['model'] + ' ' + d['ip'] for d in _discovered_printers]
+        printer_idx  = 0
+    elif _bambu:
+        snap = _bambu.snapshot()
+        printer_name = snap.printer_model
+        online = "  (online)" if snap.online else "  (connecting...)"
+        printer_opts = [printer_name + online]
+        printer_idx  = 0
+    else:
+        printer_opts = _CFG_PRINTER_FALLBACK
+        printer_idx  = 0
+
+    if _bambu:
+        snap = _bambu.snapshot()
+        if snap.filaments:
+            fil_opts = [s.display() for s in snap.filaments]
+            fil_idx  = 0
+        else:
+            fil_opts = _CFG_FILAMENT_FALLBACK
+            fil_idx  = 0
+    else:
+        fil_opts = _CFG_FILAMENT_FALLBACK
+        fil_idx  = 0
+
+    return ([
+        ("Printer",  printer_opts, printer_idx),
+        ("Filament", fil_opts,     fil_idx),
+    ] + _CFG_STATIC)
+
 
 def build_print_config():
-    return {name: idx for name, opts, idx in CFG_FIELDS}
+    return {name: idx for name, opts, idx in get_cfg_fields()}
 
 
-# ─── 3D renderer ──────────────────────────────────────────────────────────────
+# --- 3D renderer (unchanged) -----------------------------------------------
 
 def render_frame(model, W, H, scale, rot_z, rot_x):
     frame = np.full((H, W, 3), (10, 10, 10), dtype=np.uint8)
@@ -180,243 +259,322 @@ def render_frame(model, W, H, scale, rot_z, rot_x):
     return frame
 
 
-# ─── HUD constants ────────────────────────────────────────────────────────────
+# --- Pygame init and theme -------------------------------------------------
 
-FONT     = cv2.FONT_HERSHEY_SIMPLEX
-C_GREEN  = (0, 220, 120)
-C_WHITE  = (255, 255, 255)
-C_GRAY   = (150, 150, 150)
-C_YELLOW = (0, 220, 220)
-C_RED    = (80, 80, 220)
-C_DARK   = (18, 18, 18)
-C_BOX    = (32, 32, 32)
-C_DIM    = (60, 60, 60)
+pygame.font.init()
+FONT_LG   = pygame.font.SysFont("segoeui", 32, bold=True)
+FONT_MD   = pygame.font.SysFont("segoeui", 22)
+FONT_SM   = pygame.font.SysFont("segoeui", 16)
+FONT_MONO = pygame.font.SysFont("consolas", 18)
 
-
-# ─── Shared helpers ───────────────────────────────────────────────────────────
-
-def put_centered(frame, text, cx, y, scale, color, thickness=1):
-    tw = cv2.getTextSize(text, FONT, scale, thickness)[0][0]
-    cv2.putText(frame, text, (cx - tw // 2, y),
-                FONT, scale, color, thickness, cv2.LINE_AA)
-
-
-def draw_top_bar(frame, subtitle, status, status_color):
-    H, W = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (W, 42), C_DARK, -1)
-    cv2.putText(frame, "DAVIS", (12, 28), FONT, 0.85, C_GREEN, 2, cv2.LINE_AA)
-    cv2.putText(frame, subtitle, (85, 28), FONT, 0.55, C_GRAY, 1, cv2.LINE_AA)
-    if status:
-        sw = cv2.getTextSize(status, FONT, 0.52, 1)[0][0]
-        cv2.putText(frame, status, (W // 2 - sw // 2, 28),
-                    FONT, 0.52, status_color, 1, cv2.LINE_AA)
+BG       = (13, 13, 20)
+PANEL    = (22, 22, 38)
+CARD     = (28, 28, 48)
+CARD_SEL = (35, 55, 80)
+ACCENT   = (0, 210, 160)
+ACCENT2  = (0, 140, 255)
+TEXT     = (220, 220, 230)
+MUTED    = (110, 110, 130)
+RED      = (220, 70, 70)
+YELLOW   = (220, 180, 50)
+GREEN    = (60, 200, 120)
+DIM      = (45, 45, 65)
 
 
-def draw_input_bar(frame, input_text, cursor_on, generating, btn_label=None):
-    H, W = frame.shape[:2]
-    box_y = H - 138
-    cv2.rectangle(frame, (0, box_y - 4), (W, box_y + 50), C_DARK, -1)
-    cv2.putText(frame, "DESCRIBE:", (10, box_y + 30), FONT, 0.55, C_GRAY, 1, cv2.LINE_AA)
-    field_x = 105
-    border_c = C_YELLOW if generating else C_GREEN
-    cv2.rectangle(frame, (field_x, box_y), (W - 168, box_y + 42), C_BOX, -1)
-    cv2.rectangle(frame, (field_x, box_y), (W - 168, box_y + 42), border_c, 1)
-    display = input_text + ("|" if cursor_on else " ")
-    cv2.putText(frame, display, (field_x + 8, box_y + 28),
-                FONT, 0.65, C_WHITE, 1, cv2.LINE_AA)
+# --- Drawing helpers -------------------------------------------------------
+
+def draw_rect(surf, color, rect, radius=8, border=0, border_color=None):
+    pygame.draw.rect(surf, color, rect, border_radius=radius)
+    if border and border_color:
+        pygame.draw.rect(surf, border_color, rect, border, border_radius=radius)
+
+
+def draw_text(surf, text, font, color, cx=None, x=None, y=0, right=None):
+    surf2 = font.render(str(text), True, color)
+    r = surf2.get_rect()
+    if cx is not None:
+        r.centerx = cx
+    elif right is not None:
+        r.right = right
+    else:
+        r.x = x or 0
+    r.y = y
+    surf.blit(surf2, r)
+    return r
+
+
+def numpy_frame_to_surface(frame):
+    """Convert an HxWx3 BGR numpy array to a pygame Surface."""
+    rgb = frame[:, :, ::-1]  # BGR -> RGB
+    return pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
+
+
+# --- Top bar ---------------------------------------------------------------
+
+def draw_top_bar(surf, W, subtitle, status_msg):
+    """Draw the 48px top bar."""
+    BAR_H = 48
+    draw_rect(surf, PANEL, (0, 0, W, BAR_H), radius=0)
+    # Separator line
+    pygame.draw.line(surf, DIM, (0, BAR_H - 1), (W, BAR_H - 1))
+
+    # Left: DAVIS + subtitle
+    draw_text(surf, "DAVIS", FONT_LG, ACCENT, x=14, y=8)
+    davis_w = FONT_LG.size("DAVIS")[0]
+    draw_text(surf, subtitle, FONT_SM, MUTED, x=14 + davis_w + 10, y=16)
+
+    # Center: status
+    if status_msg:
+        draw_text(surf, status_msg, FONT_SM, MUTED, cx=W // 2, y=16)
+
+    # Right: printer status
+    dot_r = 6
+    dot_x = W - 14
+    name_x = dot_x - dot_r - 8
+
+    if _bambu is not None:
+        snap = _bambu.snapshot()
+        if snap.online:
+            dot_color  = GREEN
+            label      = snap.printer_model
+        else:
+            dot_color  = YELLOW
+            label      = "Connecting..."
+    else:
+        dot_color = MUTED
+        label     = "No printer"
+
+    draw_text(surf, label, FONT_SM, MUTED, right=name_x, y=16)
+    pygame.draw.circle(surf, dot_color, (dot_x - dot_r, BAR_H // 2), dot_r)
+
+
+# --- Input bar -------------------------------------------------------------
+
+def draw_input_bar(surf, W, H, input_text, cursor_on, generating, btn_label=None):
+    """Draw the 120px bottom input bar."""
+    BAR_H    = 120
+    bar_y    = H - BAR_H
+    field_h  = 42
+
+    draw_rect(surf, PANEL, (0, bar_y, W, BAR_H), radius=0)
+    pygame.draw.line(surf, DIM, (0, bar_y), (W, bar_y))
+
+    label_x = 14
+    label_y = bar_y + (BAR_H - field_h) // 2
+    draw_text(surf, "DESCRIBE:", FONT_SM, MUTED, x=label_x, y=label_y + 12)
+
+    desc_w = FONT_SM.size("DESCRIBE:")[0]
+    field_x = label_x + desc_w + 12
+    btn_w   = 180
+    field_w = W - field_x - btn_w - 28
+
+    border_c = YELLOW if generating else ACCENT
+    field_rect = (field_x, label_y, field_w, field_h)
+    draw_rect(surf, CARD, field_rect, radius=6, border=2, border_color=border_c)
+
+    display = input_text + ("|" if cursor_on else "")
+    draw_text(surf, display, FONT_MONO, TEXT, x=field_x + 10, y=label_y + 12)
+
     if btn_label is None:
         btn_label = "GENERATING..." if generating else "ENTER = GENERATE"
-    btn_c = C_YELLOW if generating else C_GREEN
-    cv2.rectangle(frame, (W - 162, box_y + 3), (W - 4, box_y + 39), C_BOX, -1)
-    cv2.rectangle(frame, (W - 162, box_y + 3), (W - 4, box_y + 39), btn_c, 1)
-    cv2.putText(frame, btn_label, (W - 158, box_y + 26),
-                FONT, 0.37, btn_c, 1, cv2.LINE_AA)
+    btn_col  = YELLOW if generating else ACCENT
+    btn_rect = (W - btn_w - 14, label_y, btn_w, field_h)
+    draw_rect(surf, CARD, btn_rect, radius=6, border=2, border_color=btn_col)
+    draw_text(surf, btn_label, FONT_SM, btn_col,
+              cx=W - btn_w - 14 + btn_w // 2, y=label_y + 13)
 
 
-# ─── Generate-mode drawing ────────────────────────────────────────────────────
+# --- Generate mode ---------------------------------------------------------
 
-def draw_hud(frame, input_text, cursor_on, scale, rot_z, rot_x,
-             status, status_color, model_info, generating):
-    H, W = frame.shape[:2]
-    draw_top_bar(frame, "PREVIEW TEST", status, status_color)
-    draw_input_bar(frame, input_text, cursor_on, generating)
+def draw_generate_mode(surf, W, H, model, input_text, cursor_on,
+                       scale, rot_z, rot_x, status, status_color,
+                       model_info, generating, tick):
+    TOP_H = 48
+    BOT_H = 120
+    VP_H  = H - TOP_H - BOT_H
+    VP_Y  = TOP_H
 
-    info_y = H - 86
-    cv2.rectangle(frame, (0, info_y), (W, H), C_DARK, -1)
-    if model_info:
-        cv2.putText(frame, f"Scale {scale * 100:.0f}%",
-                    (10, info_y + 18), FONT, 0.48, C_GREEN, 1, cv2.LINE_AA)
-        cv2.putText(frame, f"Z {rot_z % 360:.0f}deg  X {rot_x % 360:.0f}deg",
-                    (10, info_y + 36), FONT, 0.48, C_GREEN, 1, cv2.LINE_AA)
-        cv2.putText(frame, model_info, (10, info_y + 54),
-                    FONT, 0.40, C_GRAY, 1, cv2.LINE_AA)
-    hints = ["Drag  Rotate", "Scroll  Scale",
-             "<- ->  Rotate  Up Dn  Tilt", "=/-  Scale  R  Reset"]
-    for i, h in enumerate(hints):
-        cv2.putText(frame, h, (W - 200, info_y + 16 + i * 18),
-                    FONT, 0.38, C_GRAY, 1, cv2.LINE_AA)
+    surf.fill(BG)
 
+    if model is None and not generating:
+        # Idle screen
+        cy = VP_Y + VP_H // 2
+        draw_text(surf, "DAVIS  MODEL PREVIEW", FONT_LG, ACCENT, cx=W // 2, y=cy - 80)
+        draw_text(surf, "Describe any object and press ENTER", FONT_MD, MUTED,
+                  cx=W // 2, y=cy - 36)
+        examples1 = "box   cylinder   hook   bracket   ring   stand"
+        examples2 = "wedge   pyramid   sphere   cone   cross   hex"
+        draw_text(surf, examples1, FONT_SM, (80, 160, 100), cx=W // 2, y=cy + 10)
+        draw_text(surf, examples2, FONT_SM, (80, 160, 100), cx=W // 2, y=cy + 32)
+        draw_text(surf, "Add dimensions:  box 6cm wide 3cm tall",
+                  FONT_SM, MUTED, cx=W // 2, y=cy + 62)
+        draw_text(surf, "Or try gallery:  show me vase models",
+                  FONT_SM, (80, 180, 100), cx=W // 2, y=cy + 84)
+    elif model is not None and not generating:
+        # Render 3D model into viewport
+        frame = render_frame(model, W, VP_H, scale, rot_z, rot_x)
+        model_surf = numpy_frame_to_surface(frame)
+        surf.blit(model_surf, (0, VP_Y))
 
-def draw_spinner(frame, text, tick):
-    H, W = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (W, H), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    dots = "." * (tick % 4 + 1)
-    msg  = f"Generating  \"{text}\"{dots}"
-    mw   = cv2.getTextSize(msg, FONT, 0.8, 1)[0][0]
-    cv2.putText(frame, msg, (W // 2 - mw // 2, H // 2 - 8),
-                FONT, 0.8, C_GREEN, 1, cv2.LINE_AA)
-    sub = "trimesh  ->  STL"
-    sw  = cv2.getTextSize(sub, FONT, 0.45, 1)[0][0]
-    cv2.putText(frame, sub, (W // 2 - sw // 2, H // 2 + 26),
-                FONT, 0.45, C_GRAY, 1, cv2.LINE_AA)
+        # Model info overlay (bottom-left of viewport)
+        if model_info:
+            oi_y = VP_Y + VP_H - 52
+            info_rect = (6, oi_y, 420, 48)
+            info_bg = pygame.Surface((420, 48), pygame.SRCALPHA)
+            info_bg.fill((10, 10, 15, 180))
+            surf.blit(info_bg, (6, oi_y))
+            draw_text(surf, f"Scale {scale*100:.0f}%   Z {rot_z%360:.0f}deg   X {rot_x%360:.0f}deg",
+                      FONT_SM, ACCENT, x=10, y=oi_y + 4)
+            draw_text(surf, model_info, FONT_SM, MUTED, x=10, y=oi_y + 24)
 
+        # Hint overlay (bottom-right of viewport)
+        hints = ["Drag  Rotate", "Scroll  Scale", "<- ->  Rotate  Up Dn  Tilt", "=/-  Scale  R  Reset"]
+        for i, h in enumerate(hints):
+            draw_text(surf, h, FONT_SM, MUTED, right=W - 8, y=VP_Y + VP_H - 80 + i * 18)
 
-def draw_idle(frame, W, H):
-    frame[:] = (10, 10, 10)
-    lines = [
-        ("DAVIS  MODEL PREVIEW",               0.95, C_GREEN,       H // 2 - 80),
-        ("Describe any object and press ENTER", 0.55, C_GRAY,        H // 2 - 30),
-        ("box   cylinder   hook   bracket   ring   stand",
-         0.48, (80, 140, 80), H // 2 + 20),
-        ("wedge   pyramid   sphere   cone   cross   hex",
-         0.48, (80, 140, 80), H // 2 + 48),
-        ("Add dimensions:  box 6cm wide 3cm tall",
-         0.44, C_GRAY, H // 2 + 80),
-        ("Or try gallery:  show me vase models",
-         0.44, (60, 180, 80), H // 2 + 105),
-    ]
-    for txt, sz, col, y in lines:
-        if not txt:
-            continue
-        tw = cv2.getTextSize(txt, FONT, sz, 1)[0][0]
-        cv2.putText(frame, txt, (W // 2 - tw // 2, y),
-                    FONT, sz, col, 1, cv2.LINE_AA)
-
-
-# ─── Gallery mode drawing ─────────────────────────────────────────────────────
-
-def draw_gallery(frame, results, idx, loading, query, tick, input_text, cursor_on):
-    H, W = frame.shape[:2]
-    frame[:] = (12, 12, 18)
-
-    if loading:
-        status = f"Searching for \"{query}\"..."
-    elif results:
-        status = f"{len(results)} results for \"{query}\""
-    else:
-        status = f"No results for \"{query}\""
-
-    draw_top_bar(frame, "GALLERY", status, C_GRAY)
-    draw_input_bar(frame, input_text, cursor_on, False, "ENTER = SELECT")
-
-    CONTENT_TOP = 52
-    CONTENT_BOT = H - 145
-
-    if loading:
+    # Spinner overlay when generating
+    if generating:
+        overlay = pygame.Surface((W, VP_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        surf.blit(overlay, (0, VP_Y))
         dots = "." * (tick % 4 + 1)
-        msg  = f"Searching{dots}"
-        put_centered(frame, msg, W // 2, (CONTENT_TOP + CONTENT_BOT) // 2,
-                     0.9, C_GREEN)
-        return
+        msg  = f'Generating "{input_text}"{dots}'
+        draw_text(surf, msg, FONT_LG, ACCENT, cx=W // 2, y=VP_Y + VP_H // 2 - 24)
+        draw_text(surf, "trimesh  ->  STL", FONT_SM, MUTED,
+                  cx=W // 2, y=VP_Y + VP_H // 2 + 16)
 
-    if not results:
-        put_centered(frame, "No results found",
-                     W // 2, (CONTENT_TOP + CONTENT_BOT) // 2, 0.8, C_GRAY)
-        put_centered(frame, "Try a different search term",
-                     W // 2, (CONTENT_TOP + CONTENT_BOT) // 2 + 36, 0.5, C_GRAY)
-        return
+    draw_top_bar(surf, W, "PREVIEW TEST", status)
+    draw_input_bar(surf, W, H, input_text, cursor_on, generating)
+
+
+# --- Gallery mode ----------------------------------------------------------
+
+def draw_gallery_mode(surf, W, H, results, idx, loading, query, tick,
+                      input_text, cursor_on):
+    TOP_H = 48
+    BOT_H = 120
+    CONTENT_TOP = TOP_H + 8
+    CONTENT_BOT = H - BOT_H - 8
+
+    surf.fill(BG)
+
+    if loading:
+        status_msg = f'Searching for "{query}"...'
+    elif results:
+        status_msg = f'{len(results)} results for "{query}"'
+    else:
+        status_msg = f'No results for "{query}"'
+
+    btn = "ENTER = SEARCH" if input_text.strip() else "ENTER = SELECT"
+    draw_top_bar(surf, W, "GALLERY", status_msg)
+    draw_input_bar(surf, W, H, input_text, cursor_on, False, btn)
 
     CY = (CONTENT_TOP + CONTENT_BOT) // 2
 
-    CARD_W_MAIN = min(400, W // 3)
+    if loading:
+        dots = "." * (tick % 4 + 1)
+        draw_text(surf, f"Searching{dots}", FONT_LG, ACCENT, cx=W // 2, y=CY - 20)
+        return
+
+    if not results:
+        draw_text(surf, "No results found", FONT_LG, MUTED, cx=W // 2, y=CY - 24)
+        draw_text(surf, "Try a different search term", FONT_MD, MUTED,
+                  cx=W // 2, y=CY + 20)
+        return
+
+    avail_h = CONTENT_BOT - CONTENT_TOP
+    CARD_W_MAIN = min(380, W // 3)
     CARD_H_MAIN = int(CARD_W_MAIN * 0.75)
     CARD_W_SIDE = int(CARD_W_MAIN * 0.55)
     CARD_H_SIDE = int(CARD_W_SIDE * 0.75)
-    GAP = 22
-
-    def draw_card(result, cx, cy, cw, ch, dimmed):
-        x0 = cx - cw // 2
-        y0 = cy - ch // 2
-        if x0 < 0 or x0 + cw > W or y0 < 0 or y0 + ch > H:
-            return
-
-        thumb_h = ch - 24
-        thumb = load_thumbnail(result, cw, thumb_h)
-        if thumb is not None:
-            th   = min(thumb.shape[0], ch - 24)
-            tw_p = min(thumb.shape[1], cw)
-            fy0 = y0
-            fy1 = y0 + th
-            fx0 = cx - tw_p // 2
-            fx1 = fx0 + tw_p
-            if fy0 >= 0 and fy1 <= H and fx0 >= 0 and fx1 <= W:
-                frame[fy0:fy1, fx0:fx1] = thumb[:th, :tw_p]
-
-        if dimmed:
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (x0, y0), (x0 + cw, y0 + ch), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-
-        strip_y = y0 + ch - 24
-        cv2.rectangle(frame, (x0, strip_y), (x0 + cw, y0 + ch), (20, 20, 20), -1)
-        name = result.name[:28]
-        nw = cv2.getTextSize(name, FONT, 0.38, 1)[0][0]
-        nc = C_WHITE if not dimmed else C_GRAY
-        cv2.putText(frame, name, (cx - nw // 2, strip_y + 16),
-                    FONT, 0.38, nc, 1, cv2.LINE_AA)
-
-        bc    = C_GREEN if not dimmed else C_DIM
-        thick = 2 if not dimmed else 1
-        cv2.rectangle(frame, (x0, y0), (x0 + cw, y0 + ch), bc, thick)
+    GAP = 24
 
     main_cx  = W // 2
     left_cx  = main_cx - CARD_W_MAIN // 2 - CARD_W_SIDE // 2 - GAP
     right_cx = main_cx + CARD_W_MAIN // 2 + CARD_W_SIDE // 2 + GAP
 
+    def draw_card_pg(result, cx, cy_card, cw, ch, dimmed):
+        x0 = cx - cw // 2
+        y0 = cy_card - ch // 2
+        if x0 < 0 or x0 + cw > W or y0 < 0 or y0 + ch > H:
+            return
+
+        # Card background
+        draw_rect(surf, CARD, (x0, y0, cw, ch), radius=8)
+
+        # Thumbnail
+        thumb_h_area = ch - 32
+        thumb = load_thumbnail(result, cw, thumb_h_area)
+        if thumb is not None:
+            th = min(thumb.shape[0], thumb_h_area)
+            tw = min(thumb.shape[1], cw)
+            thumb_surf = numpy_frame_to_surface(thumb[:th, :tw])
+            # Clip to card area
+            clip_rect = surf.get_clip()
+            surf.set_clip((x0, y0, cw, ch - 32))
+            surf.blit(thumb_surf, (cx - tw // 2, y0))
+            surf.set_clip(clip_rect)
+
+        # Dimming overlay
+        if dimmed:
+            dim_overlay = pygame.Surface((cw, ch), pygame.SRCALPHA)
+            dim_overlay.fill((0, 0, 0, 140))
+            surf.blit(dim_overlay, (x0, y0))
+
+        # Name strip with gradient feel
+        strip_y = y0 + ch - 32
+        draw_rect(surf, (18, 18, 28), (x0, strip_y, cw, 32), radius=0)
+        name = result.name[:30]
+        nc = TEXT if not dimmed else MUTED
+        draw_text(surf, name, FONT_SM, nc, cx=cx, y=strip_y + 8)
+
+        # Border
+        bc    = ACCENT if not dimmed else DIM
+        thick = 2 if not dimmed else 1
+        pygame.draw.rect(surf, bc, (x0, y0, cw, ch), thick, border_radius=8)
+
     if idx > 0:
-        draw_card(results[idx - 1], left_cx, CY, CARD_W_SIDE, CARD_H_SIDE, True)
+        draw_card_pg(results[idx - 1], left_cx, CY, CARD_W_SIDE, CARD_H_SIDE, True)
     if idx < len(results) - 1:
-        draw_card(results[idx + 1], right_cx, CY, CARD_W_SIDE, CARD_H_SIDE, True)
-    draw_card(results[idx], main_cx, CY, CARD_W_MAIN, CARD_H_MAIN, False)
+        draw_card_pg(results[idx + 1], right_cx, CY, CARD_W_SIDE, CARD_H_SIDE, True)
+    draw_card_pg(results[idx], main_cx, CY, CARD_W_MAIN, CARD_H_MAIN, False)
 
     r = results[idx]
-    info_y = CY + CARD_H_MAIN // 2 + 22
-    put_centered(frame, r.name, main_cx, info_y, 0.55, C_WHITE, 1)
-    put_centered(frame, f"by {r.creator}   {r.likes} likes",
-                 main_cx, info_y + 22, 0.42, C_GRAY)
+    info_y = CY + CARD_H_MAIN // 2 + 16
+    draw_text(surf, r.name, FONT_MD, TEXT, cx=main_cx, y=info_y)
+    draw_text(surf, f"by {r.creator}   {r.likes} likes",
+              FONT_SM, MUTED, cx=main_cx, y=info_y + 28)
 
     # Pagination dots
-    dots_y     = info_y + 46
-    n          = min(len(results), 20)
-    dot_gap    = 12
-    dx_start   = W // 2 - n * dot_gap // 2
+    dots_y   = info_y + 54
+    n        = min(len(results), 20)
+    dot_gap  = 14
+    dx_start = W // 2 - n * dot_gap // 2
     for di in range(n):
-        col  = C_GREEN if di == idx else C_DIM
-        size = 4 if di == idx else 3
-        cv2.circle(frame, (dx_start + di * dot_gap, dots_y), size, col, -1)
+        col  = ACCENT if di == idx else DIM
+        size = 5 if di == idx else 3
+        pygame.draw.circle(surf, col, (dx_start + di * dot_gap, dots_y), size)
 
-    hint_y = H - 95
-    put_centered(frame, "<-  Previous       ENTER = Select       Next  ->",
-                 W // 2, hint_y, 0.42, C_GRAY)
-    put_centered(frame, "ESC = back to generate mode",
-                 W // 2, hint_y + 20, 0.38, C_DIM)
+    # Nav hint
+    hint_y = H - BOT_H - 28
+    draw_text(surf, "<-  Previous       ENTER = Select       Next  ->",
+              FONT_SM, MUTED, cx=W // 2, y=hint_y)
 
 
-# ─── Print config drawing ─────────────────────────────────────────────────────
+# --- Print config mode -----------------------------------------------------
 
-def draw_print_cfg(frame, result, cfg, field_idx, confirming, status, status_color):
-    H, W = frame.shape[:2]
-    frame[:] = (12, 12, 18)
+def draw_print_cfg_mode(surf, W, H, result, cfg, field_idx, confirming,
+                         status, status_color):
+    TOP_H    = 48
+    BOT_H    = 58
+    LEFT_W   = W // 2 - 20
+    CONTENT_TOP = TOP_H + 10
 
-    draw_top_bar(frame, "PRINT CONFIG", status, status_color)
+    surf.fill(BG)
+    draw_top_bar(surf, W, "PRINT CONFIG", status)
 
-    CONTENT_TOP = 52
-    LEFT_W = W // 2 - 20
-
-    # Thumbnail
-    thumb_h = 220
+    # Thumbnail (left half)
+    thumb_h = min(220, H - TOP_H - BOT_H - 120)
     thumb_w = min(LEFT_W - 20, int(thumb_h * 1.33))
     thumb = load_thumbnail(result, thumb_w, thumb_h)
     if thumb is not None:
@@ -424,62 +582,137 @@ def draw_print_cfg(frame, result, cfg, field_idx, confirming, status, status_col
         ty = CONTENT_TOP + 10
         th = min(thumb.shape[0], thumb_h)
         tw = min(thumb.shape[1], thumb_w)
-        if ty + th <= H and tx + tw <= W:
-            frame[ty:ty + th, tx:tx + tw] = thumb[:th, :tw]
+        thumb_surf = numpy_frame_to_surface(thumb[:th, :tw])
+        draw_rect(surf, CARD, (tx - 4, ty - 4, tw + 8, th + 8), radius=8)
+        surf.blit(thumb_surf, (tx, ty))
 
-    # Model info
-    info_y = CONTENT_TOP + thumb_h + 24
-    put_centered(frame, result.name[:32], LEFT_W // 2 + 10, info_y, 0.55, C_WHITE)
-    put_centered(frame, f"by {result.creator}",
-                 LEFT_W // 2 + 10, info_y + 22, 0.42, C_GRAY)
-    put_centered(frame, f"{result.likes} likes",
-                 LEFT_W // 2 + 10, info_y + 42, 0.40, C_GRAY)
-    url_lbl = f"thing:{result.thing_id}"
-    put_centered(frame, url_lbl, LEFT_W // 2 + 10, info_y + 62, 0.36, (80, 140, 80))
+    # Model info below thumbnail
+    info_y = CONTENT_TOP + 10 + thumb_h + 16
+    draw_text(surf, result.name[:32], FONT_MD, TEXT, cx=LEFT_W // 2 + 10, y=info_y)
+    draw_text(surf, f"by {result.creator}", FONT_SM, MUTED,
+              cx=LEFT_W // 2 + 10, y=info_y + 28)
+    draw_text(surf, f"{result.likes} likes", FONT_SM, MUTED,
+              cx=LEFT_W // 2 + 10, y=info_y + 48)
+    draw_text(surf, f"thing:{result.thing_id}", FONT_SM, (80, 160, 100),
+              cx=LEFT_W // 2 + 10, y=info_y + 68)
 
     # Divider
-    cv2.line(frame, (W // 2, CONTENT_TOP), (W // 2, H - 60), C_DIM, 1)
+    pygame.draw.line(surf, DIM, (W // 2, TOP_H + 4), (W // 2, H - BOT_H - 4))
 
     # Form fields (right half)
+    fields  = get_cfg_fields()
     FX      = W // 2 + 20
-    FY      = CONTENT_TOP + 30
-    F_ROW_H = max(30, (H - 120 - FY) // len(CFG_FIELDS))
+    FY      = CONTENT_TOP + 20
+    F_ROW_H = max(36, (H - TOP_H - BOT_H - 40) // len(fields))
+    ROW_W   = W - FX - 14
 
-    for fi, (name, opts, default_idx) in enumerate(CFG_FIELDS):
+    for fi, (name, opts, default_idx) in enumerate(fields):
         val_idx = cfg.get(name, default_idx)
         val     = opts[val_idx]
-        y       = FY + fi * F_ROW_H
+        ry      = FY + fi * F_ROW_H
         active  = fi == field_idx
 
-        row_col = (40, 40, 60) if active else C_BOX
-        cv2.rectangle(frame, (FX - 4, y - 2), (W - 8, y + F_ROW_H - 6), row_col, -1)
-        if active:
-            cv2.rectangle(frame, (FX - 4, y - 2), (W - 8, y + F_ROW_H - 6), C_GREEN, 1)
+        bg_col  = CARD_SEL if active else CARD
+        bdr_col = ACCENT   if active else None
+        bdr_w   = 2        if active else 0
+        draw_rect(surf, bg_col, (FX - 4, ry, ROW_W, F_ROW_H - 4),
+                  radius=6, border=bdr_w, border_color=bdr_col)
 
-        lbl_col = C_GREEN if active else C_GRAY
-        cv2.putText(frame, name, (FX, y + 14), FONT, 0.42, lbl_col, 1, cv2.LINE_AA)
+        lbl_col = ACCENT if active else MUTED
+        draw_text(surf, name, FONT_SM, lbl_col, x=FX + 8, y=ry + (F_ROW_H - 4) // 2 - 8)
 
-        val_x = FX + 140
         if active:
-            cv2.putText(frame, "<", (val_x - 18, y + 14),
-                        FONT, 0.42, C_YELLOW, 1, cv2.LINE_AA)
-        cv2.putText(frame, val, (val_x + 4, y + 14), FONT, 0.50, C_WHITE, 1, cv2.LINE_AA)
-        if active:
-            vw = cv2.getTextSize(val, FONT, 0.50, 1)[0][0]
-            cv2.putText(frame, ">", (val_x + vw + 12, y + 14),
-                        FONT, 0.42, C_YELLOW, 1, cv2.LINE_AA)
+            arrow_col = YELLOW
+            draw_text(surf, "<", FONT_MD, arrow_col,
+                      x=FX + ROW_W // 2 - 10, y=ry + (F_ROW_H - 4) // 2 - 12)
+            draw_text(surf, val, FONT_MD, TEXT,
+                      cx=FX + ROW_W // 2 + 30, y=ry + (F_ROW_H - 4) // 2 - 12)
+            val_w = FONT_MD.size(val)[0]
+            draw_text(surf, ">", FONT_MD, arrow_col,
+                      x=FX + ROW_W // 2 + 30 + val_w // 2 + 8,
+                      y=ry + (F_ROW_H - 4) // 2 - 12)
+        else:
+            draw_text(surf, val, FONT_SM, TEXT,
+                      right=FX + ROW_W - 12, y=ry + (F_ROW_H - 4) // 2 - 8)
 
     # Bottom hint bar
-    bar_y = H - 58
-    cv2.rectangle(frame, (0, bar_y), (W, H), C_DARK, -1)
+    bar_y = H - BOT_H
+    draw_rect(surf, PANEL, (0, bar_y, W, BOT_H), radius=0)
+    pygame.draw.line(surf, DIM, (0, bar_y), (W, bar_y))
     if confirming:
-        put_centered(frame, "Sending to printer...", W // 2, bar_y + 26, 0.65, C_YELLOW)
+        draw_text(surf, "Sending to printer...", FONT_MD, YELLOW,
+                  cx=W // 2, y=bar_y + 16)
     else:
-        hints = "UP/DOWN  Move field    LEFT/RIGHT  Change value    ENTER  Print    ESC  Back"
-        put_centered(frame, hints, W // 2, bar_y + 22, 0.38, C_GRAY)
+        hint = "UP/DOWN  Move field    LEFT/RIGHT  Change value    ENTER  Print    ESC  Back"
+        draw_text(surf, hint, FONT_SM, MUTED, cx=W // 2, y=bar_y + 20)
 
 
-# ─── STL save ─────────────────────────────────────────────────────────────────
+# --- Setup screen ----------------------------------------------------------
+
+def draw_setup_mode(surf, W, H, discovered, access_input, cursor_on,
+                    status, status_color, discovering):
+    surf.fill(BG)
+    draw_top_bar(surf, W, "PRINTER SETUP", status)
+
+    CY  = H // 2
+    CX  = W // 2
+    CARD_W = min(600, W - 80)
+    CARD_H = 260
+
+    cx0 = CX - CARD_W // 2
+    cy0 = CY - CARD_H // 2
+    draw_rect(surf, PANEL, (cx0, cy0, CARD_W, CARD_H), radius=14,
+              border=1, border_color=DIM)
+
+    if discovering:
+        n_dots = int(time.time() * 2) % 4 + 1
+        dots   = "." * n_dots
+        draw_text(surf, f"Scanning for Bambu printers{dots}",
+                  FONT_MD, ACCENT, cx=CX, y=cy0 + 60)
+        draw_text(surf, "Make sure printer is on the same Wi-Fi",
+                  FONT_SM, MUTED, cx=CX, y=cy0 + 100)
+        # Animated dots indicator
+        for i in range(3):
+            alpha = 255 if i < n_dots else 80
+            c = tuple(int(v * alpha / 255) for v in ACCENT)
+            pygame.draw.circle(surf, c,
+                               (CX - 20 + i * 20, cy0 + 150), 7)
+        return
+
+    if not discovered:
+        draw_text(surf, "No Bambu printer found on network",
+                  FONT_MD, RED, cx=CX, y=cy0 + 60)
+        draw_text(surf, "Make sure printer is on the same Wi-Fi",
+                  FONT_SM, MUTED, cx=CX, y=cy0 + 96)
+        draw_text(surf, "ESC to continue without printer",
+                  FONT_SM, MUTED, cx=CX, y=cy0 + 130)
+        return
+
+    d = discovered[0]
+    has_code = bool(d.get("access_code"))
+
+    draw_text(surf, f"Found: {d['model']}", FONT_LG, ACCENT, cx=CX, y=cy0 + 30)
+    draw_text(surf, f"{d['ip']}   {d['serial']}", FONT_SM, MUTED, cx=CX, y=cy0 + 70)
+
+    if has_code:
+        draw_text(surf, "Connecting...", FONT_MD, YELLOW, cx=CX, y=cy0 + 110)
+    else:
+        draw_text(surf, "Enter Access Code from printer touchscreen:",
+                  FONT_SM, TEXT, cx=CX, y=cy0 + 106)
+        draw_text(surf, "(Settings > Network > Access Code)",
+                  FONT_SM, MUTED, cx=CX, y=cy0 + 128)
+        box_w = 260
+        bx = CX - box_w // 2
+        by = cy0 + 152
+        draw_rect(surf, CARD, (bx, by, box_w, 44), radius=6,
+                  border=2, border_color=ACCENT)
+        display = access_input + ("|" if cursor_on else "")
+        draw_text(surf, display, FONT_MONO, TEXT, cx=CX, y=by + 12)
+        draw_text(surf, "ENTER to connect    ESC to skip",
+                  FONT_SM, MUTED, cx=CX, y=cy0 + 212)
+
+
+# --- STL save --------------------------------------------------------------
 
 def save_stl(mesh_trimesh, description):
     out_dir = os.path.join(os.path.dirname(__file__), "generation", "stl_cache")
@@ -490,7 +723,7 @@ def save_stl(mesh_trimesh, description):
     return path
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -510,7 +743,7 @@ def main():
     rot_z        = -35.0
     rot_x        = 25.0
     status       = "Describe an object and press ENTER"
-    status_color = C_GRAY
+    status_color = MUTED
     generating   = False
     gen_result   = {}
     dragging     = False
@@ -530,20 +763,54 @@ def main():
     cfg_field_idx  = 0
     cfg_confirming = False
     cfg_status     = ""
-    cfg_status_col = C_GRAY
+    cfg_status_col = MUTED
 
     # Timer to auto-return from print confirm
     return_to_gallery_at = None
+    # Cooldown: ignore ENTER for 0.3s after a mode switch (absorbs buffered keypresses)
+    mode_changed_at = 0.0
 
-    # ── Helper: start generate ────────────────────────────────────────────────
+    # Setup state
+    setup_discovered   = []
+    setup_discovering  = False
+    setup_access_input = ""
+    setup_status       = ""
+    setup_status_col   = MUTED
+
+    # Auto-discovery on startup if printer not configured
+    global _bambu, _discovered_printers
+    if not _printer_cfg:
+        setup_discovering = True
+        mode = AppMode.SETUP
+
+        def _on_discovered(results):
+            global _bambu, _discovered_printers
+            nonlocal setup_discovered, setup_discovering, mode
+            nonlocal setup_status, setup_status_col
+            setup_discovered   = results
+            setup_discovering  = False
+            _discovered_printers = results
+
+            complete = [r for r in results if r.get("access_code") and r.get("ip")]
+            if complete:
+                d = complete[0]
+                save_config(d["ip"], d["serial"], d["access_code"], d["model"])
+                apply_to_config(d)
+                setup_status     = f"Auto-connected: {d['model']} at {d['ip']}"
+                setup_status_col = GREEN
+                mode = AppMode.GENERATE
+
+        start_discovery(_on_discovered, ssdp_timeout=6.0)
+
+    # -- Helper: start generate --------------------------------------------
     def start_gen(text):
         nonlocal generating, gen_result, status, status_color
         if not text.strip() or generating:
             return
         intent = parse_description(text)
         if intent is None:
-            status       = f"Unknown shape: \"{text[:40]}\"  try: box, hook, bracket..."
-            status_color = C_RED
+            status       = f'Unknown shape: "{text[:40]}"  try: box, hook, bracket...'
+            status_color = RED
             return
         generating  = True
         gen_result  = {}
@@ -565,7 +832,7 @@ def main():
 
         threading.Thread(target=_run, daemon=True).start()
 
-    # ── Helper: gallery search ────────────────────────────────────────────────
+    # -- Helper: gallery search --------------------------------------------
     def start_gallery_search(query):
         nonlocal gallery_loading, gallery_results, gallery_idx, gallery_query
         gallery_loading = True
@@ -585,14 +852,15 @@ def main():
         threading.Thread(target=_run, daemon=True).start()
 
     def enter_gallery(query):
-        nonlocal mode
+        nonlocal mode, mode_changed_at
         mode = AppMode.GALLERY
+        mode_changed_at = time.time()
         start_gallery_search(query)
 
-    # ── Helper: select gallery item → print config ────────────────────────────
+    # -- Helper: select gallery item -> print config -----------------------
     def select_gallery_item():
         nonlocal mode, cfg_result, cfg_values, cfg_field_idx
-        nonlocal cfg_confirming, cfg_status, cfg_status_col
+        nonlocal cfg_confirming, cfg_status, cfg_status_col, mode_changed_at
         if not gallery_results:
             return
         r = gallery_results[gallery_idx]
@@ -601,29 +869,84 @@ def main():
         cfg_field_idx  = 0
         cfg_confirming = False
         cfg_status     = f"Configure: {r.name[:36]}"
-        cfg_status_col = C_GRAY
+        cfg_status_col = MUTED
         mode = AppMode.PRINT_CFG
+        mode_changed_at = time.time()
         start_stl_download(r, token=_TOKEN)
 
-    # ── Helper: confirm print ─────────────────────────────────────────────────
+    # -- Helper: confirm print ---------------------------------------------
     def do_print():
         nonlocal cfg_confirming, cfg_status, cfg_status_col, return_to_gallery_at
         if cfg_result is None:
             return
-        cfg_confirming       = True
-        cfg_status           = f"Print queued: {cfg_result.name[:40]}"
-        cfg_status_col       = C_GREEN
-        return_to_gallery_at = time.time() + 2.0
+        cfg_confirming = True
+        cfg_status     = "Preparing print job..."
+        cfg_status_col = YELLOW
 
         summary = {name: opts[cfg_values.get(name, idx)]
-                   for name, opts, idx in CFG_FIELDS}
+                   for name, opts, idx in get_cfg_fields()}
         print(f"\n[PRINT JOB]  {cfg_result.name}")
         print(f"  URL: {cfg_result.thing_url}")
         for k, v in summary.items():
             print(f"  {k}: {v}")
-        print(f"  STL: {cfg_result.stl_path or '(downloading...)'}")
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+        def _dispatch():
+            nonlocal cfg_status, cfg_status_col, return_to_gallery_at
+
+            t0 = time.time()
+            while cfg_result.stl_downloading and time.time() - t0 < 30:
+                time.sleep(0.3)
+
+            if cfg_result.stl_error:
+                cfg_status     = f"STL download failed: {cfg_result.stl_error[:50]}"
+                cfg_status_col = RED
+                return_to_gallery_at = time.time() + 3.0
+                return
+
+            stl_path = cfg_result.stl_path
+            print(f"  STL: {stl_path}")
+
+            try:
+                import config as cfg_mod
+                has_printer = (
+                    cfg_mod.BAMBU_IP not in ("", "192.168.1.100") and
+                    "XXX" not in cfg_mod.BAMBU_SERIAL and
+                    cfg_mod.BAMBU_ACCESS_CODE not in ("", "XXXXXXXX")
+                )
+            except Exception:
+                has_printer = False
+
+            if not has_printer:
+                cfg_status     = "Saved locally -- configure printer to dispatch"
+                cfg_status_col = YELLOW
+                return_to_gallery_at = time.time() + 3.0
+                return
+
+            try:
+                from printer.ftps_transfer import upload_stl
+                from printer.mqtt_client import send_print_job
+
+                cfg_status     = "Uploading to printer..."
+                cfg_status_col = YELLOW
+                remote_name = upload_stl(stl_path)
+
+                cfg_status     = "Sending print command..."
+                cfg_status_col = YELLOW
+                send_print_job(remote_name)
+
+                cfg_status     = f"Printing: {cfg_result.name[:40]}"
+                cfg_status_col = GREEN
+                print(f"  [OK] Dispatched to printer")
+            except Exception as exc:
+                cfg_status     = f"Printer error: {str(exc)[:60]}"
+                cfg_status_col = RED
+                print(f"  [ERROR] {exc}")
+
+            return_to_gallery_at = time.time() + 3.0
+
+        threading.Thread(target=_dispatch, daemon=True).start()
+
+    # -- Main loop ---------------------------------------------------------
     while True:
         W, H = screen.get_size()
 
@@ -638,7 +961,7 @@ def main():
             generating = False
             if "error" in gen_result:
                 status       = f"Error: {gen_result['error'][:70]}"
-                status_color = C_RED
+                status_color = RED
                 print(f"Generation error: {gen_result['error']}")
             else:
                 stl_path  = gen_result["path"]
@@ -654,7 +977,7 @@ def main():
                               f"x{intent.depth_mm:.0f}mm  "
                               f"{tris} tris  {kb:.1f}KB  {elapsed:.2f}s")
                 status       = f"Generated: {intent.shape}  ({elapsed:.2f}s)"
-                status_color = C_GREEN
+                status_color = GREEN
                 print(f"\nSTL: {stl_path}\n     {model_info}")
 
         # Events
@@ -665,10 +988,15 @@ def main():
 
             elif event.type == pygame.KEYDOWN:
                 k = event.key
+                enter_ready = (k != pygame.K_RETURN or
+                               time.time() - mode_changed_at > 0.3)
 
                 # ESC always goes back one level
                 if k == pygame.K_ESCAPE:
-                    if mode == AppMode.PRINT_CFG:
+                    mode_changed_at = time.time()
+                    if mode == AppMode.SETUP:
+                        mode = AppMode.GENERATE
+                    elif mode == AppMode.PRINT_CFG:
                         mode = AppMode.GALLERY
                     elif mode == AppMode.GALLERY:
                         mode = AppMode.GENERATE
@@ -676,12 +1004,37 @@ def main():
                         pygame.quit()
                         return
 
+                # SETUP mode keys
+                elif mode == AppMode.SETUP:
+                    if not setup_discovering and setup_discovered:
+                        if k == pygame.K_RETURN and enter_ready and setup_access_input.strip():
+                            d = setup_discovered[0]
+                            save_config(d["ip"], d["serial"],
+                                        setup_access_input.strip(), d["model"])
+                            apply_to_config({
+                                "ip": d["ip"], "serial": d["serial"],
+                                "access_code": setup_access_input.strip(),
+                                "model": d["model"],
+                            })
+                            _bambu = get_bambu_status()
+                            setup_status     = f"Connected: {d['model']}"
+                            setup_status_col = GREEN
+                            mode_changed_at  = time.time()
+                            mode = AppMode.GENERATE
+                        elif k == pygame.K_BACKSPACE:
+                            setup_access_input = setup_access_input[:-1]
+                        else:
+                            ch = event.unicode
+                            if ch and ch.isprintable() and len(setup_access_input) < 12:
+                                setup_access_input += ch
+
                 # GENERATE mode keys
                 elif mode == AppMode.GENERATE:
-                    if k == pygame.K_RETURN:
+                    if k == pygame.K_RETURN and enter_ready:
                         q = is_gallery_intent(input_text)
                         if q is not None:
                             enter_gallery(q)
+                            input_text = ""   # clear so ENTER in gallery selects, not re-searches
                         else:
                             start_gen(input_text)
                     elif k == pygame.K_BACKSPACE:
@@ -703,18 +1056,21 @@ def main():
 
                 # GALLERY mode keys
                 elif mode == AppMode.GALLERY:
-                    if k == pygame.K_RETURN:
-                        q = is_gallery_intent(input_text)
-                        if q is not None:
+                    if k == pygame.K_RETURN and enter_ready:
+                        if input_text.strip():
+                            q = is_gallery_intent(input_text) or input_text.strip()
                             start_gallery_search(q)
+                            input_text = ""
                         else:
-                            select_gallery_item()
+                            if gallery_loading:
+                                status = "Still loading..."
+                            elif gallery_results:
+                                select_gallery_item()
                     elif k == pygame.K_LEFT:
                         gallery_idx = max(0, gallery_idx - 1)
                     elif k == pygame.K_RIGHT:
                         if gallery_results:
-                            gallery_idx = min(len(gallery_results) - 1,
-                                              gallery_idx + 1)
+                            gallery_idx = min(len(gallery_results) - 1, gallery_idx + 1)
                     elif k == pygame.K_BACKSPACE:
                         input_text = input_text[:-1]
                     else:
@@ -724,24 +1080,35 @@ def main():
 
                 # PRINT CONFIG mode keys
                 elif mode == AppMode.PRINT_CFG:
-                    if k == pygame.K_RETURN and not cfg_confirming:
+                    _fields = get_cfg_fields()
+                    if k == pygame.K_RETURN and not cfg_confirming and enter_ready:
                         do_print()
                     elif k == pygame.K_UP:
-                        cfg_field_idx = (cfg_field_idx - 1) % len(CFG_FIELDS)
+                        cfg_field_idx = (cfg_field_idx - 1) % len(_fields)
                     elif k == pygame.K_DOWN:
-                        cfg_field_idx = (cfg_field_idx + 1) % len(CFG_FIELDS)
+                        cfg_field_idx = (cfg_field_idx + 1) % len(_fields)
                     elif k == pygame.K_LEFT:
-                        name, opts, default_idx = CFG_FIELDS[cfg_field_idx]
+                        name, opts, default_idx = _fields[cfg_field_idx]
                         cur = cfg_values.get(name, default_idx)
                         cfg_values[name] = (cur - 1) % len(opts)
+                        # If Printer field changed, apply to config
+                        if name == "Printer" and _discovered_printers:
+                            new_idx = cfg_values[name]
+                            if new_idx < len(_discovered_printers):
+                                apply_to_config(_discovered_printers[new_idx])
                     elif k == pygame.K_RIGHT:
-                        name, opts, default_idx = CFG_FIELDS[cfg_field_idx]
+                        name, opts, default_idx = _fields[cfg_field_idx]
                         cur = cfg_values.get(name, default_idx)
                         cfg_values[name] = (cur + 1) % len(opts)
+                        # If Printer field changed, apply to config
+                        if name == "Printer" and _discovered_printers:
+                            new_idx = cfg_values[name]
+                            if new_idx < len(_discovered_printers):
+                                apply_to_config(_discovered_printers[new_idx])
 
             # Mouse events
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                dragging = True
+                dragging  = True
                 drag_last = event.pos
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if mode == AppMode.GALLERY and dragging:
@@ -762,38 +1129,33 @@ def main():
                 if mode == AppMode.GENERATE:
                     scale = max(0.1, min(5.0, scale + event.y * 0.08))
 
-        # ── Render ────────────────────────────────────────────────────────────
-        frame     = np.full((H, W, 3), (10, 10, 10), dtype=np.uint8)
+        # -- Render --------------------------------------------------------
         cursor_on = (cursor_tick // 30) % 2 == 0
 
         if mode == AppMode.GENERATE:
-            if model is None and not generating:
-                draw_idle(frame, W, H)
-            elif model is not None:
-                frame = render_frame(model, W, H, scale, rot_z, rot_x)
-            if generating:
-                draw_spinner(frame, input_text, tick)
-            draw_hud(frame, input_text, cursor_on,
-                     scale, rot_z, rot_x,
-                     status, status_color, model_info, generating)
+            draw_generate_mode(screen, W, H, model, input_text, cursor_on,
+                               scale, rot_z, rot_x, status, status_color,
+                               model_info, generating, tick)
 
         elif mode == AppMode.GALLERY:
-            draw_gallery(frame, gallery_results, gallery_idx,
-                         gallery_loading, gallery_query, tick,
-                         input_text, cursor_on)
+            draw_gallery_mode(screen, W, H, gallery_results, gallery_idx,
+                              gallery_loading, gallery_query, tick,
+                              input_text, cursor_on)
 
         elif mode == AppMode.PRINT_CFG:
             if cfg_result is not None:
-                draw_print_cfg(frame, cfg_result, cfg_values, cfg_field_idx,
-                               cfg_confirming, cfg_status, cfg_status_col)
+                draw_print_cfg_mode(screen, W, H, cfg_result, cfg_values,
+                                    cfg_field_idx, cfg_confirming,
+                                    cfg_status, cfg_status_col)
 
-        surface = pygame.surfarray.make_surface(
-            np.transpose(frame[:, :, ::-1], (1, 0, 2))
-        )
-        screen.blit(surface, (0, 0))
+        elif mode == AppMode.SETUP:
+            draw_setup_mode(screen, W, H, setup_discovered, setup_access_input,
+                            cursor_on, setup_status, setup_status_col,
+                            setup_discovering)
+
         pygame.display.flip()
         clock.tick(60)
-        tick += 1
+        tick        += 1
         cursor_tick += 1
 
 

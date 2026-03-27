@@ -96,7 +96,7 @@ def _build_payload(remote_filename: str) -> dict:
             "command": "project_file",
             "param": f"Metadata/plate_1.gcode",
             "subtask_name": remote_filename,
-            "url": f"ftp://{remote_filename}",
+            "url": f"ftp://bblp:{config.BAMBU_ACCESS_CODE}@{config.BAMBU_IP}/upload/{remote_filename}",
             "bed_type": "auto",
             "timelapse": False,
             "bed_leveling": True,

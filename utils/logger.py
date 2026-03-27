@@ -22,7 +22,9 @@ def _init_logging() -> None:
     level_name = os.environ.get("LOG_LEVEL", "DEBUG").upper()
     level = getattr(logging, level_name, logging.DEBUG)
 
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(open(sys.stdout.fileno(),
+                                         mode="w", encoding="utf-8",
+                                         closefd=False, buffering=1))
     handler.setLevel(level)
 
     formatter = logging.Formatter(
