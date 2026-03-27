@@ -18,3 +18,4 @@ printer_config.json
 
 # Thingiverse thumbnail/STL cache
 generation/thingiverse_cache/
+generation/slice_output/
