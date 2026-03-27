@@ -1,0 +1,19 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.DS_Store
+
+# Generated STL and SCAD files
+generation/stl_cache/
+
+# Vosk model (large binary — download via setup_pi.sh)
+models/
+
+# Local secrets (never commit printer credentials)
+config.local.py
+
+# Thingiverse thumbnail/STL cache
+generation/thingiverse_cache/

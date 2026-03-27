@@ -1,0 +1,44 @@
+# DAVIS dependencies
+# Install on Raspberry Pi OS (Bookworm):
+#   pip install -r requirements.txt
+#
+# System packages required first:
+#   sudo apt update
+#   sudo apt install openscad libatlas-base-dev libhdf5-dev python3-dev portaudio19-dev
+
+# Voice
+vosk==0.3.45
+sounddevice==0.4.6
+
+# STL loading + 3D math
+numpy==1.26.4
+numpy-stl==3.1.1
+
+# ── Text2STL engine ──────────────────────────────────────────────────────────
+# Font parsing (pure Python — reads any TTF/OTF)
+fonttools==4.53.1
+# 2D polygon operations (requires libgeos on Pi: sudo apt install libgeos-dev)
+shapely==2.0.6
+# 3D mesh extrusion + STL export
+trimesh==4.4.3
+# trimesh optional deps for cleaner mesh generation
+scipy==1.13.1
+# Triangulation engine required by trimesh for polygon extrusion
+mapbox-earcut==2.0.0
+# Boolean mesh operations (hollow box, cylinder bore, ring cutout)
+manifold3d==3.4.1
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Gesture vision
+opencv-python-headless==4.9.0.80
+mediapipe==0.10.11
+
+# Projector display (no OpenCV GUI backend conflict)
+pygame==2.5.2
+
+# Printer communication
+paho-mqtt==2.0.0
+
+# Testing
+pytest==8.1.1
+pytest-mock==3.14.0
